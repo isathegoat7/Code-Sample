@@ -1,5 +1,5 @@
---!strict
 --Roblox: Z0MBBI3E, Discord: deadstarisa
+--!strict
 --@author: isa
 --@date: 10/11/26
 --[[@description

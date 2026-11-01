@@ -3,7 +3,8 @@
 --@author: isa
 --@date: 10/11/26
 --[[@description
-	server side of bow system
+	server side of the bow system. checks every shot a client asks for,
+	flies the arrow on the server and deals the damage when it lands
 ]]
 --------------------------------
 -- SERVICES --
@@ -15,10 +16,10 @@ local RunService = game:GetService("RunService")
 --------------------------------
 -- DEPENDENCIES
 --------------------------------
-local ClientModules = ReplicatedStorage.Shared.Modules
-local Network = require(ClientModules.Core.Network)
-local Config = require(ClientModules.Platform.Bow)
-local ArrowFlight = require(ClientModules.Game.Bow.ArrowFlight)
+local Modules = ReplicatedStorage.Shared.Modules
+local Network = require(Modules.Core.Network)
+local Config = require(Modules.Platform.Bow)
+local ArrowFlight = require(Modules.Game.Bow.ArrowFlight)
 --------------------------------
 -- TYPES --
 --------------------------------
@@ -34,238 +35,398 @@ type LiveArrow = {
 	Flight: ArrowFlight.Flight,
 }
 --------------------------------
+-- CONSTANTS --
+--------------------------------
+-- //Length of the arrow model, used to sink the tip into whatever it hits
+local ArrowTemplate = ReplicatedStorage.Assets.Bow:FindFirstChild("Arrow") :: BasePart
+local ARROW_LENGTH = (ArrowTemplate:GetAttribute("Length") :: number?) or ArrowTemplate.Size.Z
+
+-- //How long a kill still counts for the shooter after their arrow hits
+local CREATOR_TAG_LIFETIME = 2
+
+-- //Shortest direction the client can send before the shot is thrown out
+local MIN_DIRECTION_LENGTH = 0.5
+--------------------------------
 -- VARIABLES --
 --------------------------------
-local Module = {}
+local BowEvent = Network.Bow
+local BowService = {}
 local Actions: { [string]: (Player, ...any) -> () } = {}
 
-local arrowTemplate = ReplicatedStorage.Assets.Bow:FindFirstChild("Arrow") :: BasePart
-local ARROW_LENGTH = (arrowTemplate:GetAttribute("Length") :: number?) or arrowTemplate.Size.Z
+-- //Draw and reload timing for every player in the server
+local Shooters: { [Player]: Shooter } = {}
 
-local shooters: { [Player]: Shooter } = {}
-local liveArrows: { LiveArrow } = {}
+-- //Every arrow that is still flying
+local LiveArrows: { LiveArrow } = {}
 --------------------------------
 -- PRIVATE FUNCTIONS --
 --------------------------------
-local function bowHolder(player: Player): Model?
-	local character = player.Character
-	if not character then
+-- //Gives back the character if the player is alive and holding the bow
+local function GetBowHolder(Player: Player): Model?
+	local Character = Player.Character
+	if not Character then
 		return nil
 	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health <= 0 then
+
+	local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+	if not Humanoid or Humanoid.Health <= 0 then
 		return nil
 	end
-	local tool = character:FindFirstChild("Bow")
-	if not tool or not tool:IsA("Tool") then
+
+	local Tool = Character:FindFirstChild("Bow")
+	if not Tool or not Tool:IsA("Tool") then
 		return nil
 	end
-	return character
+
+	return Character
 end
 
-local function findHumanoid(part: Instance): (Humanoid?, Model?)
-	local model = part:FindFirstAncestorOfClass("Model")
-	while model do
-		local humanoid = model:FindFirstChildOfClass("Humanoid")
-		if humanoid then
-			return humanoid, model
+-- //Walks up from the part that was hit until it finds a model with a humanoid
+local function FindHumanoid(Part: Instance): (Humanoid?, Model?)
+	local Model = Part:FindFirstAncestorOfClass("Model")
+
+	while Model do
+		local Humanoid = Model:FindFirstChildOfClass("Humanoid")
+		if Humanoid then
+			return Humanoid, Model
 		end
-		model = model:FindFirstAncestorOfClass("Model")
+
+		Model = Model:FindFirstAncestorOfClass("Model")
 	end
+
 	return nil, nil
 end
 
-local function isHeadshot(part: BasePart): boolean
-	if part.Name == "Head" then
+-- //The head, or a hat welded to the head, counts as a headshot
+local function IsHeadshot(Part: BasePart): boolean
+	if Part.Name == "Head" then
 		return true
 	end
-	if part:FindFirstAncestorOfClass("Accessory") then
-		local weld = part:FindFirstChild("AccessoryWeld")
-		return weld ~= nil and weld:IsA("Weld") and weld.Part1 ~= nil and weld.Part1.Name == "Head"
+
+	if not Part:FindFirstAncestorOfClass("Accessory") then
+		return false
 	end
-	return false
+
+	local Weld = Part:FindFirstChild("AccessoryWeld")
+	if not Weld or not Weld:IsA("Weld") then
+		return false
+	end
+
+	return Weld.Part1 ~= nil and Weld.Part1.Name == "Head"
 end
 
-local function damageFor(charge: number, headshot: boolean): number
-	local damage = Config.MinDamage + (Config.MaxDamage - Config.MinDamage) * charge
-	if headshot then
-		damage *= Config.HeadshotMultiplier
+-- //Damage grows with how far the bow was drawn and is multiplied on a headshot
+local function GetDamage(Charge: number, Headshot: boolean): number
+	local Damage = Config.MinDamage + (Config.MaxDamage - Config.MinDamage) * Charge
+
+	if Headshot then
+		Damage *= Config.HeadshotMultiplier
 	end
-	return math.round(damage)
+
+	return math.round(Damage)
 end
 
-local function tagKiller(humanoid: Humanoid, player: Player)
-	local old = humanoid:FindFirstChild("creator")
-	if old then
-		old:Destroy()
+-- //Marks who hit the humanoid last so the kill can be credited to them
+local function TagKiller(Humanoid: Humanoid, Player: Player)
+	local OldTag = Humanoid:FindFirstChild("creator")
+	if OldTag then
+		OldTag:Destroy()
 	end
-	local tag = Instance.new("ObjectValue")
-	tag.Name = "creator"
-	tag.Value = player
-	tag.Parent = humanoid
-	Debris:AddItem(tag, 2)
+
+	local Tag = Instance.new("ObjectValue")
+	Tag.Name = "creator"
+	Tag.Value = Player
+	Tag.Parent = Humanoid
+	Debris:AddItem(Tag, CREATOR_TAG_LIFETIME)
 end
 
-local function landArrow(arrow: LiveArrow, hit: RaycastResult)
-	local part = hit.Instance
-	local resting = ArrowFlight.restingCFrame(hit.Position, arrow.Flight.Direction, ARROW_LENGTH, arrow.Charge)
-	Network.Bow:FireAllClients("Land", arrow.Player, arrow.ShotId, part, part.CFrame:ToObjectSpace(resting))
+-- //The target has to be alive, not the shooter, not protected, and allowed to be hurt
+local function CanDamage(Arrow: LiveArrow, Humanoid: Humanoid, Model: Model): boolean
+	if Humanoid.Health <= 0 then
+		return false
+	end
 
-	local humanoid, model = findHumanoid(part)
-	if not humanoid or not model or humanoid.Health <= 0 then
+	if Model == Arrow.Player.Character then
+		return false
+	end
+
+	if Model:FindFirstChildOfClass("ForceField") then
+		return false
+	end
+
+	if Players:GetPlayerFromCharacter(Model) and not Config.DamagePlayers then
+		return false
+	end
+
+	return true
+end
+
+-- //Deals the damage, then tells the shooter so they get a hitmarker
+local function DamageTarget(Arrow: LiveArrow, Humanoid: Humanoid, Part: BasePart, Position: Vector3)
+	local Headshot = IsHeadshot(Part)
+	local Damage = GetDamage(Arrow.Charge, Headshot)
+
+	TagKiller(Humanoid, Arrow.Player)
+	Humanoid:TakeDamage(Damage)
+
+	-- //The shooter may have left while the arrow was flying
+	if not Arrow.Player.Parent then
 		return
 	end
-	if model == arrow.Player.Character or model:FindFirstChildOfClass("ForceField") then
-		return
-	end
-	if Players:GetPlayerFromCharacter(model) and not Config.DamagePlayers then
+
+	BowEvent:FireClient(Arrow.Player, "Hit", Position, Damage, Headshot, Humanoid.Health <= 0)
+end
+
+-- //Sticks the arrow where it hit for everyone, then damages whatever it hit
+local function LandArrow(Arrow: LiveArrow, Hit: RaycastResult)
+	local Part = Hit.Instance
+	local RestingCFrame = ArrowFlight.restingCFrame(Hit.Position, Arrow.Flight.Direction, ARROW_LENGTH, Arrow.Charge)
+
+	BowEvent:FireAllClients("Land", Arrow.Player, Arrow.ShotId, Part, Part.CFrame:ToObjectSpace(RestingCFrame))
+
+	local Humanoid, Model = FindHumanoid(Part)
+	if not Humanoid or not Model then
 		return
 	end
 
-	local headshot = isHeadshot(part)
-	local damage = damageFor(arrow.Charge, headshot)
-	tagKiller(humanoid, arrow.Player)
-	humanoid:TakeDamage(damage)
+	if not CanDamage(Arrow, Humanoid, Model) then
+		return
+	end
 
-	if arrow.Player.Parent then
-		Network.Bow:FireClient(arrow.Player, "Hit", hit.Position, damage, headshot, humanoid.Health <= 0)
+	DamageTarget(Arrow, Humanoid, Part, Hit.Position)
+end
+
+-- //Takes an arrow out of the list by moving the last one into its slot
+local function RemoveArrow(Index: number)
+	LiveArrows[Index] = LiveArrows[#LiveArrows]
+	LiveArrows[#LiveArrows] = nil
+end
+
+-- //Moves every flying arrow forward and lands the ones that hit something
+local function StepArrows(DeltaTime: number)
+	for Index = #LiveArrows, 1, -1 do
+		local Arrow = LiveArrows[Index]
+		local Hit, Expired = ArrowFlight.step(Arrow.Flight, DeltaTime)
+
+		if not Hit and not Expired then
+			continue
+		end
+
+		RemoveArrow(Index)
+
+		if Hit then
+			LandArrow(Arrow, Hit)
+		end
 	end
 end
 
-local function stepArrows(dt: number)
-	for index = #liveArrows, 1, -1 do
-		local arrow = liveArrows[index]
-		local hit, expired = ArrowFlight.step(arrow.Flight, dt)
-		if hit or expired then
-			liveArrows[index] = liveArrows[#liveArrows]
-			liveArrows[#liveArrows] = nil
-		end
-		if hit then
-			landArrow(arrow, hit)
-		end
+-- //Stops any draw in progress and refills the player's arrows
+local function ResetShooter(Player: Player)
+	local Shooter = Shooters[Player]
+	if Shooter then
+		Shooter.DrawStartedAt = nil
 	end
+
+	Player:SetAttribute("Arrows", Config.StartingArrows)
 end
 
-local function setupPlayer(player: Player)
-	shooters[player] = { DrawStartedAt = nil, LastShotAt = 0 }
-	player:SetAttribute("Arrows", Config.StartingArrows)
-	player.CharacterAdded:Connect(function()
-		local shooter = shooters[player]
-		if shooter then
-			shooter.DrawStartedAt = nil
-		end
-		player:SetAttribute("Arrows", Config.StartingArrows)
+-- //Gives a joining player their shooter data and resets them on every respawn
+local function SetupPlayer(Player: Player)
+	Shooters[Player] = { DrawStartedAt = nil, LastShotAt = 0 }
+	ResetShooter(Player)
+
+	Player.CharacterAdded:Connect(function()
+		ResetShooter(Player)
 	end)
 end
 
-function Actions.Draw(player: Player)
-	local shooter = shooters[player]
-	if shooter and bowHolder(player) then
-		shooter.DrawStartedAt = os.clock()
-	end
+-- //Clears the player's shooter data when they leave
+local function RemovePlayer(Player: Player)
+	Shooters[Player] = nil
 end
 
-function Actions.Cancel(player: Player)
-	local shooter = shooters[player]
-	if shooter then
-		shooter.DrawStartedAt = nil
+-- //Everything the client sent has to be the right type and not NaN
+local function IsValidShot(Origin: any, Direction: any, Charge: any, ShotId: any): boolean
+	if typeof(Origin) ~= "Vector3" or typeof(Direction) ~= "Vector3" then
+		return false
 	end
+
+	if typeof(Charge) ~= "number" or typeof(ShotId) ~= "number" then
+		return false
+	end
+
+	-- //NaN is the only value that isn't equal to itself
+	if Origin ~= Origin or Direction ~= Direction or Charge ~= Charge then
+		return false
+	end
+
+	return true
 end
 
-function Actions.Fire(player: Player, origin: any, direction: any, charge: any, shotId: any)
-	if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then
-		return
-	end
-	if typeof(charge) ~= "number" or typeof(shotId) ~= "number" then
-		return
-	end
-	if origin ~= origin or direction ~= direction or charge ~= charge then
-		return
+-- //The bow has to finish reloading before it can fire again
+local function IsReloaded(Shooter: Shooter, Now: number): boolean
+	return Now - Shooter.LastShotAt >= Config.ReloadTime * Config.Validation.ReloadLeniency
+end
+
+-- //How many arrows the player has left
+local function GetArrows(Player: Player): number
+	local Arrows = Player:GetAttribute("Arrows")
+	if typeof(Arrows) ~= "number" then
+		return 0
 	end
 
-	local shooter = shooters[player]
-	local character = bowHolder(player)
-	if not shooter or not character then
-		return
+	return Arrows
+end
+
+-- //The arrow has to start near the shooter's head and point somewhere
+local function IsValidOrigin(Character: Model, Origin: Vector3, Direction: Vector3): boolean
+	local Head = Character:FindFirstChild("Head")
+	if not Head or not Head:IsA("BasePart") then
+		return false
 	end
 
-	local drawStartedAt = shooter.DrawStartedAt
-	shooter.DrawStartedAt = nil
-	local now = os.clock()
-	if not drawStartedAt or now - shooter.LastShotAt < Config.ReloadTime * Config.Validation.ReloadLeniency then
-		return
+	if (Origin - Head.Position).Magnitude > Config.Validation.MaxOriginDistance then
+		return false
 	end
 
-	local arrows = player:GetAttribute("Arrows")
-	if typeof(arrows) ~= "number" or arrows <= 0 then
-		return
+	return Direction.Magnitude >= MIN_DIRECTION_LENGTH
+end
+
+-- //Caps the charge to how long the bow was really held, nil if it's too weak to fire
+local function GetPower(DrawStartedAt: number, Now: number, Charge: number): number?
+	local MaxCharge = math.min(1, (Now - DrawStartedAt + Config.Validation.ChargeLeniency) / Config.DrawTime)
+	if MaxCharge < Config.MinCharge then
+		return nil
 	end
 
-	local head = character:FindFirstChild("Head")
-	if not head or not head:IsA("BasePart") then
-		return
-	end
-	if (origin - head.Position).Magnitude > Config.Validation.MaxOriginDistance or direction.Magnitude < 0.5 then
-		return
-	end
+	return math.clamp(Charge, Config.MinCharge, MaxCharge)
+end
 
-	local maxCharge = math.min(1, (now - drawStartedAt + Config.Validation.ChargeLeniency) / Config.DrawTime)
-	if maxCharge < Config.MinCharge then
-		return
-	end
-	local power = math.clamp(charge, Config.MinCharge, maxCharge)
+-- //Raycast params that ignore the shooter's own character
+local function GetRaycastParams(Character: Model): RaycastParams
+	local Params = RaycastParams.new()
+	Params.FilterType = Enum.RaycastFilterType.Exclude
+	Params.FilterDescendantsInstances = { Character }
+	Params.IgnoreWater = true
 
-	shooter.LastShotAt = now
-	player:SetAttribute("Arrows", arrows - 1)
+	return Params
+end
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { character }
-	params.IgnoreWater = true
+-- //Starts the arrow flying on the server and shows it to everyone except the shooter
+local function LaunchArrow(Player: Player, Character: Model, Origin: Vector3, Direction: Vector3, Power: number, ShotId: number)
+	local Velocity = Direction.Unit * ArrowFlight.speedFor(Power)
 
-	local velocity = direction.Unit * ArrowFlight.speedFor(power)
-	table.insert(liveArrows, {
-		Player = player,
-		ShotId = shotId,
-		Charge = power,
-		Flight = ArrowFlight.new(origin, velocity, params),
+	table.insert(LiveArrows, {
+		Player = Player,
+		ShotId = ShotId,
+		Charge = Power,
+		Flight = ArrowFlight.new(Origin, Velocity, GetRaycastParams(Character)),
 	})
 
-	for _, other in Players:GetPlayers() do
-		if other ~= player then
-			Network.Bow:FireClient(other, "Arrow", player, origin, velocity, shotId)
+	for _, Other in Players:GetPlayers() do
+		if Other == Player then
+			continue
 		end
+
+		BowEvent:FireClient(Other, "Arrow", Player, Origin, Velocity, ShotId)
 	end
+end
+
+-- //Sends each client request to its action and ignores anything else
+local function OnBowEvent(Player: Player, Action: any, ...: any)
+	if typeof(Action) ~= "string" then
+		return
+	end
+
+	local Handler = Actions[Action]
+	if not Handler then
+		return
+	end
+
+	Handler(Player, ...)
+end
+--------------------------------
+-- ACTIONS --
+--------------------------------
+-- //The player started drawing the bow
+function Actions.Draw(Player: Player)
+	local Shooter = Shooters[Player]
+	if not Shooter or not GetBowHolder(Player) then
+		return
+	end
+
+	Shooter.DrawStartedAt = os.clock()
+end
+
+-- //The player let go of the draw without firing
+function Actions.Cancel(Player: Player)
+	local Shooter = Shooters[Player]
+	if not Shooter then
+		return
+	end
+
+	Shooter.DrawStartedAt = nil
+end
+
+-- //The player released the bow, check the shot and fire the arrow
+function Actions.Fire(Player: Player, Origin: any, Direction: any, Charge: any, ShotId: any)
+	if not IsValidShot(Origin, Direction, Charge, ShotId) then
+		return
+	end
+
+	local Shooter = Shooters[Player]
+	local Character = GetBowHolder(Player)
+	if not Shooter or not Character then
+		return
+	end
+
+	-- //Every release ends the draw, even one that gets rejected
+	local DrawStartedAt = Shooter.DrawStartedAt
+	Shooter.DrawStartedAt = nil
+
+	local Now = os.clock()
+	if not DrawStartedAt or not IsReloaded(Shooter, Now) then
+		return
+	end
+
+	local Arrows = GetArrows(Player)
+	if Arrows <= 0 then
+		return
+	end
+
+	if not IsValidOrigin(Character, Origin, Direction) then
+		return
+	end
+
+	local Power = GetPower(DrawStartedAt, Now, Charge)
+	if not Power then
+		return
+	end
+
+	-- //The shot is good, so start the reload and use up an arrow
+	Shooter.LastShotAt = Now
+	Player:SetAttribute("Arrows", Arrows - 1)
+
+	-- //Fire the arrow
+	LaunchArrow(Player, Character, Origin, Direction, Power, ShotId)
 end
 --------------------------------
 -- PUBLIC FUNCTIONS --
 --------------------------------
-function Module.Start()
-	Network.Bow.OnServerEvent:Connect(function(player: Player, action: any, ...: any)
-		if typeof(action) ~= "string" then
-			return
-		end
-		local handler = Actions[action]
-		if handler then
-			handler(player, ...)
-		end
-	end)
+function BowService.Start()
+	-- //Listen for draw, cancel and fire requests from clients
+	BowEvent.OnServerEvent:Connect(OnBowEvent)
 
-	Players.PlayerAdded:Connect(setupPlayer)
-	Players.PlayerRemoving:Connect(function(player)
-		shooters[player] = nil
-	end)
-	for _, player : Player in ipairs(Players:GetChildren()) do
-		if not shooters[player] then
-			setupPlayer(player)
-		end
+	-- //Set up players as they join, plus anyone already in the server
+	Players.PlayerAdded:Connect(SetupPlayer)
+	Players.PlayerRemoving:Connect(RemovePlayer)
+
+	for _, Player in Players:GetPlayers() do
+		SetupPlayer(Player)
 	end
 
-	RunService.Heartbeat:Connect(stepArrows)
+	-- //Move every flying arrow each frame
+	RunService.Heartbeat:Connect(StepArrows)
 end
 
-function Module.Init()
-
-end
-
-return Module
+return BowService

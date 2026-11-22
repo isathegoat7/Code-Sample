@@ -1,0 +1,332 @@
+--!strict
+--Roblox: Z0MBBI3E, Discord: deadstarisa
+
+-- The purpose of this module is to create a physical ai model that studies and reads from previous players data, trying multiple gameplay combinations until it becomes on the level or better than the #1 player.
+-- [IMPORTANT] To test, grab the three cashes and rejoin!
+const DEBUG_TAG = `{script.Name}`
+
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local _storeVersion = "Test_004"
+local AIStore = DataStoreService:GetDataStore(_storeVersion)
+
+local AIService = {}
+local WAIT_TIME = 60 -- In seconds
+local _playerTrackingData = {} :: {[Player] : {string}}
+local _connections = {} :: {[Player] : {RBXScriptConnection}} 
+local _cashConnections = {} :: {[BasePart] : {RBXScriptConnection}}
+local _queuedPlayers = {} :: {[Player] : TrainingData}
+
+export type TrainingData = {UserId : number, Money : number, MoneyCollected : {string}}
+
+local function cashTouchedEvent(otherPart : BasePart, cash : BasePart)
+	if not otherPart or otherPart.Parent == nil then return end
+	if not _cashConnections[cash] then return end
+
+	local Player = Players:GetPlayerFromCharacter(otherPart.Parent)
+
+	if not Player or Player.Parent == nil then 
+		if otherPart.Parent.Name ~= "AIModel" then return end
+
+		for _, Connection : RBXScriptConnection in _cashConnections[cash] do
+			Connection:Disconnect()
+		end
+		_cashConnections[cash] = nil
+
+		local Clone = cash:Clone()
+		task.delay(2, function()
+			Clone.Parent = workspace.Cash
+		end)
+
+		cash:Destroy()
+		return 
+	end
+
+	if Player:GetAttribute("Money") == nil then return end
+
+	table.insert(_playerTrackingData[Player], cash.Name)
+	print(_playerTrackingData)
+	local Clone = cash:Clone()
+	task.delay(2, function()
+		Clone.Parent = workspace.Cash
+	end)
+
+	for _, Connection : RBXScriptConnection in _cashConnections[cash] do
+		Connection:Disconnect()
+	end
+	_cashConnections[cash] = nil
+	
+	Player:SetAttribute("Money", Player:GetAttribute("Money") + cash:GetAttribute("Amount"))
+	
+	cash:Destroy()
+end
+
+function AIService.onPlayerInit(player : Player)
+	-- Adds a player to the queue as soon as they are loaded.
+	if not player.Parent or player.Parent == nil then return end 
+	
+	local Store, Loaded = AIService.getStore(player.UserId)
+	if not Loaded or not player.Parent then return end
+	
+	if player:GetAttribute("Money") == nil then
+		player:SetAttribute("Money", Store ~= nil and Store.Money or 0)
+	end
+	
+	local MoneyAttribute = player:GetAttribute("Money")
+	local MoneyAttributeExists = MoneyAttribute ~= nil
+	
+	if not MoneyAttribute then return end
+	
+	if not _connections[player] then
+		_connections[player] = {}
+	end
+	
+	-- If they have existing connections, clean them up.
+	if _connections[player][1] then 
+		for _, Connection in ipairs(_connections[player]) do
+			Connection:Disconnect()
+		end
+		_connections[player] = {}
+	end
+	
+	-- Add player to the connections.
+	table.insert(_connections[player], player:GetAttributeChangedSignal("Money"):Connect(function()
+		if not player.Parent or player.Parent == nil then return end 
+		if _queuedPlayers[player] or not (player:GetAttribute("Money") > MoneyAttribute) then return end
+		
+		_queuedPlayers[player] = {
+			UserId = player.UserId,
+			Money = MoneyAttribute,
+			MoneyCollected = _playerTrackingData[player] ~= nil and _playerTrackingData[player] or {},
+		}
+	end))
+	
+	-- If they have a store, and their money attribute is different than their current one, add them to the queue, if not, return.
+	if Store then
+		if MoneyAttribute ~= Store.Money then
+		else
+			return
+		end
+	end
+	
+	-- Add player to the queue.
+	_queuedPlayers[player] = {
+		UserId = player.UserId,
+		Money = if MoneyAttributeExists then MoneyAttribute else 0,
+		MoneyCollected = _playerTrackingData[player] ~= nil and _playerTrackingData[player] or {},
+	}
+	
+	print(`{DEBUG_TAG} Added {player.Name} to the queue.`)
+end
+
+function AIService.initAI()
+	local AIModel = ReplicatedStorage:FindFirstChild("AIModel")
+	if not AIModel then return end
+	
+	local highestMoney = -math.huge
+	local highestMoneyPlayer = nil :: TrainingData?
+	
+	-- Loop through all players and find the most successful one.
+	for _, Player in Players:GetPlayers() do
+		
+		if not Player or Player.Parent == nil then continue end
+	
+		local Store = AIService.getStore(Player.UserId) :: TrainingData?
+		if Store == nil then continue end
+		
+		if not Store.Money then continue end
+		
+		-- If the player has more money than the current highest, set them as the highest.
+		if Store.Money and Store.Money > highestMoney then
+			highestMoney = Store.Money
+			highestMoneyPlayer = Store
+			print(Store,highestMoney)
+		end
+	end
+	
+	-- If there is no highest money player, return.
+	if not highestMoneyPlayer then return end
+	
+	local ExistingAI = workspace:FindFirstChild("AIModel")
+	if ExistingAI then ExistingAI:Destroy() end
+	
+	local Clone = AIModel:Clone() :: Model
+	Clone:PivotTo(workspace.SpawnLocation.CFrame + Vector3.new(0, workspace.SpawnLocation.Size.Y / 2 + 3, 0))
+	Clone.Parent = workspace
+	
+	local RootPart = Clone:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if RootPart then RootPart:SetNetworkOwner(nil) end
+	
+	-- Replicate which cashes the players collected
+	for _, CashName in highestMoneyPlayer.MoneyCollected do
+		local MatchingCashPart = workspace.Cash:FindFirstChild(CashName) :: BasePart
+		if not MatchingCashPart then continue end
+		
+		local Humanoid = Clone:FindFirstChild("Humanoid") :: Humanoid
+		if not Humanoid then return end
+		
+		Humanoid:MoveTo(MatchingCashPart.Position)
+		Humanoid.MoveToFinished:Wait()
+		Humanoid:MoveTo(workspace.SpawnLocation.Position)
+		Humanoid.MoveToFinished:Wait()
+	end
+end
+
+function AIService.onPlayerRemoved(player : Player)
+	-- Removes a player from the queue when they leave, or adds their data if they aren't in the store.
+	local PlayerIsInQueue = _queuedPlayers[player] ~= nil
+	
+	if _connections[player] then
+		for _, Connection in ipairs(_connections[player]) do
+			Connection:Disconnect()
+		end
+		_connections[player] = nil
+	end
+	_playerTrackingData[player] = nil
+	
+	if not PlayerIsInQueue then return end 
+	
+	print(`{DEBUG_TAG} Removed {player.Name} from the queue.`)
+	
+	-- Set their data to the store just in case they disconnected.
+	if PlayerIsInQueue then
+		local Success, Error = pcall(function()
+			AIStore:SetAsync(tostring(player.UserId), {
+				UserId = player.UserId,
+				Money = player:GetAttribute("Money") or _queuedPlayers[player].Money,
+				MoneyCollected = _queuedPlayers[player].MoneyCollected or {},
+			})
+		end)
+		
+		if not Success then
+			warn(`{DEBUG_TAG} Failed to save {player.Name} on leave. Error: {Error}`)
+		end
+	end
+	
+	_queuedPlayers[player] = nil
+end
+
+function AIService.handleQueue()
+	task.spawn(function()
+		while task.wait(WAIT_TIME) do
+			
+			for Player, Data : TrainingData in pairs(_queuedPlayers) do
+				-- If the player is not in the game, remove them from the queue.
+				if Player.Parent == nil then
+					_queuedPlayers[Player] = nil
+	
+					continue
+				end
+				
+				-- If the player has not changed their money, skip them.
+				local MoneyAttribute = Player:GetAttribute("Money") or 0
+				if MoneyAttribute == Data.Money then
+					warn(`{DEBUG_TAG} Players money has not changed since the last update. Skipping player.`)
+					continue
+				end
+				
+				-- Wrap SetAsync calls in a pcall to prevent errors and error masking.
+				local Success, Error = pcall(function()
+					AIStore:SetAsync(tostring(Player.UserId), {
+						UserId = Player.UserId,
+						Money = MoneyAttribute,
+						MoneyCollected = _queuedPlayers[Player].MoneyCollected or {},
+					})
+				end)
+				
+				if Success then
+					print(`{DEBUG_TAG} Added {Player.Name} to the store!`)
+					_queuedPlayers[Player] = {UserId = Player.UserId, Money = MoneyAttribute, MoneyCollected = _playerTrackingData[Player] or {}}
+				else
+					warn(`{DEBUG_TAG} Failed to add {Player.Name} to the store. Error: {Error}`)
+				end
+			end
+		end
+	end)
+end
+
+function AIService.getQueuedPlayers() : {[Player] : TrainingData}?
+	-- If theres no entries in queued players, or queued players is nil for some reason, return
+	if not next(_queuedPlayers) or _queuedPlayers == nil then
+		warn(`{DEBUG_TAG} No players in queue.`)
+		return nil
+	end
+	
+	-- return the queued players dictionary
+	return _queuedPlayers
+end
+
+function AIService.getStore(userId : number) : (TrainingData?, boolean)
+	-- Tostring id and check if its nil or not
+	local ThisId = tostring(userId)
+	local Exists = ThisId ~= nil
+	
+	-- If their id cannot be converted to a string then return
+	if not Exists then return nil, false end
+	
+	-- Another pcall for safety
+	local Success, Result = pcall(function()
+		return AIStore:GetAsync(ThisId)
+	end)
+	
+	-- Success condition
+	if not Success then
+		warn(`{DEBUG_TAG} Failed to get {ThisId} from the store. Error: {Result}`)
+		return nil, false
+	end
+	
+	return Result, true
+end
+
+function AIService.start()
+	Players.PlayerAdded:Connect(function(player)
+		_playerTrackingData[player] = {}
+		AIService.onPlayerInit(player)
+		AIService.initAI()
+	end)
+	
+	Players.PlayerRemoving:Connect(function(player)
+		AIService.onPlayerRemoved(player)
+	end)
+	
+	for _, player in Players:GetPlayers() do
+		if _playerTrackingData[player] then continue end
+		
+		_playerTrackingData[player] = {}
+		task.spawn(function()
+			AIService.onPlayerInit(player)
+			AIService.initAI()
+		end)
+	end
+	
+	game:BindToClose(function()
+		for _, player in Players:GetPlayers() do
+			AIService.onPlayerRemoved(player)
+		end
+	end)
+	
+	AIService.handleQueue()
+	
+	for _, Cash : typeof(workspace.Cash["1"]) in workspace.Cash:GetChildren() do
+		if not Cash or Cash.Parent == nil then continue end
+		
+		_cashConnections[Cash] = {}
+		
+		table.insert(_cashConnections[Cash], Cash.Touched:Connect(function(otherPart : BasePart)
+			cashTouchedEvent(otherPart, Cash)
+		end))
+	end
+	
+	workspace.Cash.ChildAdded:Connect(function(newChild)
+		if not newChild or newChild.Parent == nil then return end
+		
+		_cashConnections[newChild] = {}
+		
+		table.insert(_cashConnections[newChild], newChild.Touched:Connect(function(otherPart : BasePart)
+			cashTouchedEvent(otherPart, newChild)
+		end))
+	end)
+end
+
+return AIService
